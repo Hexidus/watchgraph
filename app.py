@@ -101,6 +101,8 @@ async def create_ai_system(
     """
     Register a new AI system for compliance monitoring
     
+    Automatically assigns applicable EU AI Act requirements based on risk category.
+    
     - **name**: Name of the AI system (required)
     - **risk_category**: EU AI Act risk category (required)
         - unacceptable: Prohibited AI systems
@@ -112,6 +114,9 @@ async def create_ai_system(
     - **department**: Department or team
     - **owner_email**: Contact email for the system owner
     """
+    import json
+    from models import RequirementMapping
+    
     # Create new AI system
     db_system = AISystem(
         name=system.name,
@@ -125,6 +130,28 @@ async def create_ai_system(
     db.add(db_system)
     db.commit()
     db.refresh(db_system)
+    
+    # Automatically assign applicable requirements based on risk category
+    applicable_requirements = db.query(ComplianceRequirement).all()
+    
+    requirements_assigned = 0
+    for requirement in applicable_requirements:
+        # Parse the applies_to JSON field
+        applies_to = json.loads(requirement.applies_to)
+        
+        # Check if this requirement applies to the system's risk category
+        if system.risk_category in applies_to:
+            mapping = RequirementMapping(
+                ai_system_id=db_system.id,
+                requirement_id=requirement.id,
+                status=ComplianceStatus.NOT_STARTED
+            )
+            db.add(mapping)
+            requirements_assigned += 1
+    
+    db.commit()
+    
+    print(f"✅ Created AI system '{db_system.name}' with {requirements_assigned} requirements assigned")
     
     # Convert to response format
     return AISystemResponse(
@@ -186,6 +213,125 @@ async def get_ai_system(system_id: str, db: Session = Depends(get_db)):
         created_at=system.created_at.isoformat(),
         updated_at=system.updated_at.isoformat()
     )
+
+# Requirements Endpoints
+@app.get("/api/requirements")
+async def list_requirements(db: Session = Depends(get_db)):
+    """
+    List all EU AI Act compliance requirements
+    
+    Returns all available compliance requirements in the system.
+    """
+    requirements = db.query(ComplianceRequirement).all()
+    
+    import json
+    return [
+        {
+            "id": req.id,
+            "article": req.article,
+            "title": req.title,
+            "description": req.description,
+            "applies_to": json.loads(req.applies_to)
+        }
+        for req in requirements
+    ]
+
+@app.get("/api/systems/{system_id}/requirements")
+async def get_system_requirements(system_id: str, db: Session = Depends(get_db)):
+    """
+    Get all compliance requirements for a specific AI system
+    
+    Returns requirements with their current compliance status.
+    """
+    from models import RequirementMapping
+    
+    # Check if system exists
+    system = db.query(AISystem).filter(AISystem.id == system_id).first()
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    # Get all requirement mappings for this system
+    mappings = db.query(RequirementMapping).filter(
+        RequirementMapping.ai_system_id == system_id
+    ).all()
+    
+    results = []
+    for mapping in mappings:
+        requirement = db.query(ComplianceRequirement).filter(
+            ComplianceRequirement.id == mapping.requirement_id
+        ).first()
+        
+        if requirement:
+            import json
+            results.append({
+                "mapping_id": mapping.id,
+                "requirement_id": requirement.id,
+                "article": requirement.article,
+                "title": requirement.title,
+                "description": requirement.description,
+                "status": mapping.status.value,
+                "notes": mapping.notes,
+                "updated_at": mapping.updated_at.isoformat()
+            })
+    
+    return results
+
+@app.get("/api/systems/{system_id}/compliance")
+async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
+    """
+    Get compliance status overview for an AI system
+    
+    Returns compliance percentage and requirement breakdown.
+    """
+    from models import RequirementMapping
+    
+    # Check if system exists
+    system = db.query(AISystem).filter(AISystem.id == system_id).first()
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    # Get all requirement mappings
+    mappings = db.query(RequirementMapping).filter(
+        RequirementMapping.ai_system_id == system_id
+    ).all()
+    
+    total_requirements = len(mappings)
+    if total_requirements == 0:
+        return {
+            "system_id": system_id,
+            "system_name": system.name,
+            "risk_category": system.risk_category.value,
+            "total_requirements": 0,
+            "compliance_percentage": 0,
+            "status_breakdown": {}
+        }
+    
+    # Calculate status breakdown
+    status_counts = {
+        "not_started": 0,
+        "in_progress": 0,
+        "completed": 0,
+        "non_compliant": 0
+    }
+    
+    for mapping in mappings:
+        status_counts[mapping.status.value] += 1
+    
+    # Calculate compliance percentage (completed / total)
+    compliance_percentage = (status_counts["completed"] / total_requirements) * 100
+    
+    return {
+        "system_id": system_id,
+        "system_name": system.name,
+        "risk_category": system.risk_category.value,
+        "total_requirements": total_requirements,
+        "compliance_percentage": round(compliance_percentage, 2),
+        "status_breakdown": status_counts,
+        "requirements_completed": status_counts["completed"],
+        "requirements_in_progress": status_counts["in_progress"],
+        "requirements_not_started": status_counts["not_started"],
+        "requirements_non_compliant": status_counts["non_compliant"]
+    }
 
 @app.get("/api/compliance")
 async def compliance():
