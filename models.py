@@ -1,7 +1,7 @@
-from sqlalchemy import Column, String, Integer, DateTime, Enum, ForeignKey, Text, JSON
+from sqlalchemy import Column, String, Integer, DateTime, Enum, ForeignKey, Text, JSON, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, date
 import enum
 import uuid
 
@@ -20,6 +20,13 @@ class ComplianceStatus(str, enum.Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     NON_COMPLIANT = "non_compliant"
+
+class EvidenceStatus(str, enum.Enum):
+    """Status for evidence lifecycle"""
+    CURRENT = "current"
+    EXPIRING_SOON = "expiring_soon"
+    EXPIRED = "expired"
+    ARCHIVED = "archived"
 
 class AISystem(Base):
     """AI System being monitored for compliance"""
@@ -80,19 +87,39 @@ class RequirementMapping(Base):
     evidence = relationship("Evidence", back_populates="requirement_mapping")
 
 class Evidence(Base):
-    """Evidence/documentation supporting compliance"""
+    """Evidence/documentation supporting compliance - stored in S3"""
     __tablename__ = "evidence"
     
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     ai_system_id = Column(String(36), ForeignKey("ai_systems.id"), nullable=False)
-    requirement_mapping_id = Column(String(36), ForeignKey("requirement_mappings.id"))
+    requirement_mapping_id = Column(String(36), ForeignKey("requirement_mappings.id"), nullable=True)
     
-    title = Column(String(255), nullable=False)
-    description = Column(Text)
-    file_url = Column(String(500))  # URL to stored file (Azure Blob Storage later)
+    # File metadata (S3 storage)
+    file_name = Column(String(255), nullable=False)
+    file_type = Column(String(50), nullable=False)  # pdf, png, jpg, xlsx, docx, csv
+    file_size = Column(Integer, nullable=False)      # bytes
+    s3_key = Column(String(500), nullable=False)     # Full S3 object path
+    
+    # Legacy fields (for backward compatibility)
+    title = Column(String(255), nullable=True)
+    file_url = Column(String(500), nullable=True)
+    
+    # Description
+    description = Column(Text, nullable=True)
+    
+    # Evidence lifecycle
+    status = Column(Enum(EvidenceStatus), default=EvidenceStatus.CURRENT)
+    expiration_date = Column(Date, nullable=True)  # When evidence expires
+    
+    # Tracking
+    uploaded_by = Column(String(255), nullable=True)  # Email of uploader
+    
+    # Soft delete
+    deleted_at = Column(DateTime, nullable=True)
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationships
     ai_system = relationship("AISystem", back_populates="evidence")

@@ -3,14 +3,19 @@ from sqlalchemy.orm import sessionmaker
 from models import Base
 import os
 
-# SQLite database for local development
+# Database URL - defaults to SQLite for local dev, use DATABASE_URL env var for production
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./watchgraph.db")
 
+# Handle PostgreSQL URL format from some providers (postgres:// vs postgresql://)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 # Create engine
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-)
+connect_args = {}
+if "sqlite" in DATABASE_URL:
+    connect_args["check_same_thread"] = False
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

@@ -1,10 +1,23 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import os
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import get_db, init_db
-from models import AISystem, ComplianceRequirement, RiskCategory, ComplianceStatus
+from models import (
+    AISystem, ComplianceRequirement, RiskCategory, ComplianceStatus,
+    RequirementMapping, Evidence, EvidenceStatus
+)
+from s3_service import (
+    generate_s3_key,
+    upload_file_to_s3,
+    generate_presigned_download_url,
+    delete_file_from_s3,
+    MIME_TYPE_MAP,
+    ALLOWED_FILE_TYPES,
+    MAX_FILE_SIZE
+)
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
@@ -44,6 +57,23 @@ class RequirementStatusUpdate(BaseModel):
     
     class Config:
         use_enum_values = True
+
+class EvidenceResponse(BaseModel):
+    """Schema for evidence response"""
+    id: str
+    ai_system_id: str
+    requirement_mapping_id: Optional[str]
+    file_name: str
+    file_type: str
+    file_size: int
+    status: str
+    description: Optional[str]
+    expiration_date: Optional[str]
+    uploaded_by: Optional[str]
+    created_at: str
+    
+    class Config:
+        from_attributes = True
 
 app = FastAPI(
     title="WatchGraph API",
@@ -101,7 +131,10 @@ async def version():
         "environment": os.getenv("ENVIRONMENT", "development")
     }
 
-# AI Systems Endpoints
+# ============================================
+# AI SYSTEMS ENDPOINTS
+# ============================================
+
 @app.post("/api/systems", response_model=AISystemResponse, status_code=201)
 async def create_ai_system(
     system: AISystemCreate,
@@ -111,20 +144,8 @@ async def create_ai_system(
     Register a new AI system for compliance monitoring
     
     Automatically assigns applicable EU AI Act requirements based on risk category.
-    
-    - **name**: Name of the AI system (required)
-    - **risk_category**: EU AI Act risk category (required)
-        - unacceptable: Prohibited AI systems
-        - high: High-risk AI systems
-        - limited: Limited risk (transparency obligations)
-        - minimal: Minimal/no risk
-    - **description**: Detailed description of the system
-    - **organization**: Organization name
-    - **department**: Department or team
-    - **owner_email**: Contact email for the system owner
     """
     import json
-    from models import RequirementMapping
     
     # Create new AI system
     db_system = AISystem(
@@ -145,10 +166,7 @@ async def create_ai_system(
     
     requirements_assigned = 0
     for requirement in applicable_requirements:
-        # Parse the applies_to JSON field
         applies_to = json.loads(requirement.applies_to)
-        
-        # Check if this requirement applies to the system's risk category
         if system.risk_category in applies_to:
             mapping = RequirementMapping(
                 ai_system_id=db_system.id,
@@ -162,7 +180,6 @@ async def create_ai_system(
     
     print(f"✅ Created AI system '{db_system.name}' with {requirements_assigned} requirements assigned")
     
-    # Convert to response format
     return AISystemResponse(
         id=db_system.id,
         name=db_system.name,
@@ -177,11 +194,7 @@ async def create_ai_system(
 
 @app.get("/api/systems", response_model=List[AISystemResponse])
 async def list_ai_systems(db: Session = Depends(get_db)):
-    """
-    List all registered AI systems
-    
-    Returns a list of all AI systems being monitored for compliance.
-    """
+    """List all registered AI systems"""
     systems = db.query(AISystem).all()
     
     return [
@@ -201,11 +214,7 @@ async def list_ai_systems(db: Session = Depends(get_db)):
 
 @app.get("/api/systems/{system_id}", response_model=AISystemResponse)
 async def get_ai_system(system_id: str, db: Session = Depends(get_db)):
-    """
-    Get details of a specific AI system
-    
-    - **system_id**: UUID of the AI system
-    """
+    """Get details of a specific AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     
     if not system:
@@ -223,14 +232,13 @@ async def get_ai_system(system_id: str, db: Session = Depends(get_db)):
         updated_at=system.updated_at.isoformat()
     )
 
-# Requirements Endpoints
+# ============================================
+# REQUIREMENTS ENDPOINTS
+# ============================================
+
 @app.get("/api/requirements")
 async def list_requirements(db: Session = Depends(get_db)):
-    """
-    List all EU AI Act compliance requirements
-    
-    Returns all available compliance requirements in the system.
-    """
+    """List all EU AI Act compliance requirements"""
     requirements = db.query(ComplianceRequirement).all()
     
     import json
@@ -247,19 +255,11 @@ async def list_requirements(db: Session = Depends(get_db)):
 
 @app.get("/api/systems/{system_id}/requirements")
 async def get_system_requirements(system_id: str, db: Session = Depends(get_db)):
-    """
-    Get all compliance requirements for a specific AI system
-    
-    Returns requirements with their current compliance status.
-    """
-    from models import RequirementMapping
-    
-    # Check if system exists
+    """Get all compliance requirements for a specific AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
     
-    # Get all requirement mappings for this system
     mappings = db.query(RequirementMapping).filter(
         RequirementMapping.ai_system_id == system_id
     ).all()
@@ -287,19 +287,11 @@ async def get_system_requirements(system_id: str, db: Session = Depends(get_db))
 
 @app.get("/api/systems/{system_id}/compliance")
 async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
-    """
-    Get compliance status overview for an AI system
-    
-    Returns compliance percentage and requirement breakdown.
-    """
-    from models import RequirementMapping
-    
-    # Check if system exists
+    """Get compliance status overview for an AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
     
-    # Get all requirement mappings
     mappings = db.query(RequirementMapping).filter(
         RequirementMapping.ai_system_id == system_id
     ).all()
@@ -315,7 +307,6 @@ async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
             "status_breakdown": {}
         }
     
-    # Calculate status breakdown
     status_counts = {
         "not_started": 0,
         "in_progress": 0,
@@ -326,7 +317,6 @@ async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
     for mapping in mappings:
         status_counts[mapping.status.value] += 1
     
-    # Calculate compliance percentage (completed / total)
     compliance_percentage = (status_counts["completed"] / total_requirements) * 100
     
     return {
@@ -342,26 +332,13 @@ async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
         "requirements_non_compliant": status_counts["non_compliant"]
     }
 
-# Requirement Status Update Endpoint
 @app.put("/api/requirements/{mapping_id}")
 async def update_requirement_status(
     mapping_id: str,
     update: RequirementStatusUpdate,
     db: Session = Depends(get_db)
 ):
-    """
-    Update the compliance status of a requirement
-    
-    Allows updating the status, notes, and tracking who made the change.
-    
-    - **mapping_id**: UUID of the requirement mapping
-    - **status**: New status (not_started, in_progress, completed, non_compliant)
-    - **notes**: Optional notes about the requirement or change
-    - **updated_by**: Email of person making the update
-    """
-    from models import RequirementMapping
-    
-    # Find the requirement mapping
+    """Update the compliance status of a requirement"""
     mapping = db.query(RequirementMapping).filter(
         RequirementMapping.id == mapping_id
     ).first()
@@ -369,10 +346,8 @@ async def update_requirement_status(
     if not mapping:
         raise HTTPException(status_code=404, detail="Requirement mapping not found")
     
-    # Store old status for logging
     old_status = mapping.status.value
     
-    # Update the mapping
     mapping.status = ComplianceStatus(update.status)
     if update.notes is not None:
         mapping.notes = update.notes
@@ -382,7 +357,6 @@ async def update_requirement_status(
     db.commit()
     db.refresh(mapping)
     
-    # Get the requirement details for response
     requirement = db.query(ComplianceRequirement).filter(
         ComplianceRequirement.id == mapping.requirement_id
     ).first()
@@ -402,6 +376,361 @@ async def update_requirement_status(
         "updated_at": mapping.updated_at.isoformat()
     }
 
+# ============================================
+# EVIDENCE ENDPOINTS
+# ============================================
+
+@app.post("/api/requirements/{mapping_id}/evidence", status_code=201)
+async def upload_evidence(
+    mapping_id: str,
+    file: UploadFile = File(..., description="Evidence file (PDF, PNG, JPG, XLSX, DOCX, CSV)"),
+    description: Optional[str] = Form(None, description="Description of the evidence"),
+    expiration_date: Optional[str] = Form(None, description="Expiration date (YYYY-MM-DD)"),
+    uploaded_by: Optional[str] = Form(None, description="Email of uploader"),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload evidence file for a requirement
+    
+    Uploads the file to S3 and stores metadata in the database.
+    """
+    # Verify requirement mapping exists
+    mapping = db.query(RequirementMapping).filter(RequirementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Requirement mapping not found")
+    
+    # Get the AI system for organization info
+    system = db.query(AISystem).filter(AISystem.id == mapping.ai_system_id).first()
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    # Validate file type
+    if not file.filename or '.' not in file.filename:
+        raise HTTPException(status_code=400, detail="File must have an extension")
+    
+    file_ext = file.filename.rsplit('.', 1)[1].lower()
+    if file_ext not in ALLOWED_FILE_TYPES:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"File type '{file_ext}' not allowed. Allowed: {', '.join(ALLOWED_FILE_TYPES)}"
+        )
+    
+    # Read and validate file size
+    file_content = await file.read()
+    file_size = len(file_content)
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+        )
+    
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="File is empty")
+    
+    # Generate S3 key
+    s3_key = generate_s3_key(
+        organization=system.organization,
+        system_id=system.id,
+        requirement_mapping_id=mapping_id,
+        filename=file.filename
+    )
+    
+    # Upload to S3
+    try:
+        content_type = MIME_TYPE_MAP.get(file_ext, "application/octet-stream")
+        upload_file_to_s3(file_content, s3_key, content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Parse expiration date if provided
+    exp_date = None
+    if expiration_date:
+        try:
+            exp_date = datetime.strptime(expiration_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # Create database record
+    evidence = Evidence(
+        ai_system_id=system.id,
+        requirement_mapping_id=mapping_id,
+        file_name=file.filename,
+        file_type=file_ext,
+        file_size=file_size,
+        s3_key=s3_key,
+        description=description,
+        expiration_date=exp_date,
+        uploaded_by=uploaded_by,
+        status=EvidenceStatus.CURRENT
+    )
+    
+    db.add(evidence)
+    db.commit()
+    db.refresh(evidence)
+    
+    print(f"✅ Evidence '{file.filename}' uploaded for requirement mapping {mapping_id}")
+    
+    return {
+        "message": f"Successfully uploaded {file.filename}",
+        "evidence": {
+            "id": evidence.id,
+            "file_name": evidence.file_name,
+            "file_type": evidence.file_type,
+            "file_size": evidence.file_size,
+            "status": evidence.status.value,
+            "created_at": evidence.created_at.isoformat()
+        }
+    }
+
+
+@app.get("/api/requirements/{mapping_id}/evidence")
+async def list_requirement_evidence(
+    mapping_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db)
+):
+    """List all evidence for a requirement mapping"""
+    mapping = db.query(RequirementMapping).filter(RequirementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Requirement mapping not found")
+    
+    page_size = min(page_size, 100)
+    
+    query = db.query(Evidence).filter(
+        Evidence.requirement_mapping_id == mapping_id,
+        Evidence.deleted_at.is_(None)
+    )
+    
+    total = query.count()
+    
+    evidence_list = query.order_by(Evidence.created_at.desc()) \
+        .offset((page - 1) * page_size) \
+        .limit(page_size) \
+        .all()
+    
+    return {
+        "items": [
+            {
+                "id": e.id,
+                "file_name": e.file_name,
+                "file_type": e.file_type,
+                "file_size": e.file_size,
+                "status": e.status.value,
+                "description": e.description,
+                "expiration_date": e.expiration_date.isoformat() if e.expiration_date else None,
+                "uploaded_by": e.uploaded_by,
+                "created_at": e.created_at.isoformat()
+            }
+            for e in evidence_list
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
+
+
+@app.get("/api/systems/{system_id}/evidence")
+async def list_system_evidence(
+    system_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db)
+):
+    """List all evidence for an AI system (across all requirements)"""
+    system = db.query(AISystem).filter(AISystem.id == system_id).first()
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    page_size = min(page_size, 100)
+    
+    query = db.query(Evidence).filter(
+        Evidence.ai_system_id == system_id,
+        Evidence.deleted_at.is_(None)
+    )
+    
+    total = query.count()
+    
+    evidence_list = query.order_by(Evidence.created_at.desc()) \
+        .offset((page - 1) * page_size) \
+        .limit(page_size) \
+        .all()
+    
+    return {
+        "items": [
+            {
+                "id": e.id,
+                "requirement_mapping_id": e.requirement_mapping_id,
+                "file_name": e.file_name,
+                "file_type": e.file_type,
+                "file_size": e.file_size,
+                "status": e.status.value,
+                "description": e.description,
+                "expiration_date": e.expiration_date.isoformat() if e.expiration_date else None,
+                "uploaded_by": e.uploaded_by,
+                "created_at": e.created_at.isoformat()
+            }
+            for e in evidence_list
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
+
+
+@app.get("/api/evidence/{evidence_id}")
+async def get_evidence(evidence_id: str, db: Session = Depends(get_db)):
+    """Get details of a specific evidence file"""
+    evidence = db.query(Evidence).filter(
+        Evidence.id == evidence_id,
+        Evidence.deleted_at.is_(None)
+    ).first()
+    
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    
+    return {
+        "id": evidence.id,
+        "ai_system_id": evidence.ai_system_id,
+        "requirement_mapping_id": evidence.requirement_mapping_id,
+        "file_name": evidence.file_name,
+        "file_type": evidence.file_type,
+        "file_size": evidence.file_size,
+        "status": evidence.status.value,
+        "description": evidence.description,
+        "expiration_date": evidence.expiration_date.isoformat() if evidence.expiration_date else None,
+        "uploaded_by": evidence.uploaded_by,
+        "created_at": evidence.created_at.isoformat(),
+        "updated_at": evidence.updated_at.isoformat()
+    }
+
+
+@app.get("/api/evidence/{evidence_id}/download")
+async def download_evidence(evidence_id: str, db: Session = Depends(get_db)):
+    """Get a pre-signed download URL for evidence (expires in 5 minutes)"""
+    evidence = db.query(Evidence).filter(
+        Evidence.id == evidence_id,
+        Evidence.deleted_at.is_(None)
+    ).first()
+    
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    
+    try:
+        download_url = generate_presigned_download_url(
+            s3_key=evidence.s3_key,
+            filename=evidence.file_name,
+            expires_in=300
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to generate download URL")
+    
+    return {
+        "download_url": download_url,
+        "expires_in_seconds": 300,
+        "file_name": evidence.file_name,
+        "file_type": evidence.file_type
+    }
+
+
+@app.patch("/api/evidence/{evidence_id}")
+async def update_evidence(
+    evidence_id: str,
+    description: Optional[str] = None,
+    expiration_date: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Update evidence metadata"""
+    evidence = db.query(Evidence).filter(
+        Evidence.id == evidence_id,
+        Evidence.deleted_at.is_(None)
+    ).first()
+    
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    
+    if description is not None:
+        evidence.description = description
+    
+    if expiration_date is not None:
+        try:
+            evidence.expiration_date = datetime.strptime(expiration_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    if status is not None:
+        try:
+            evidence.status = EvidenceStatus(status)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid status. Must be one of: {[s.value for s in EvidenceStatus]}"
+            )
+    
+    db.commit()
+    db.refresh(evidence)
+    
+    return {
+        "id": evidence.id,
+        "file_name": evidence.file_name,
+        "status": evidence.status.value,
+        "description": evidence.description,
+        "expiration_date": evidence.expiration_date.isoformat() if evidence.expiration_date else None,
+        "updated_at": evidence.updated_at.isoformat()
+    }
+
+
+@app.delete("/api/evidence/{evidence_id}", status_code=204)
+async def delete_evidence(evidence_id: str, db: Session = Depends(get_db)):
+    """Delete evidence (soft delete - file retained in S3 for audit)"""
+    evidence = db.query(Evidence).filter(
+        Evidence.id == evidence_id,
+        Evidence.deleted_at.is_(None)
+    ).first()
+    
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    
+    evidence.deleted_at = datetime.utcnow()
+    db.commit()
+    
+    print(f"✅ Evidence '{evidence.file_name}' soft deleted")
+    
+    return None
+
+
+@app.get("/api/requirements/{mapping_id}/evidence/stats")
+async def get_evidence_stats(mapping_id: str, db: Session = Depends(get_db)):
+    """Get evidence statistics for a requirement mapping"""
+    mapping = db.query(RequirementMapping).filter(RequirementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Requirement mapping not found")
+    
+    stats = db.query(
+        Evidence.status,
+        func.count(Evidence.id)
+    ).filter(
+        Evidence.requirement_mapping_id == mapping_id,
+        Evidence.deleted_at.is_(None)
+    ).group_by(Evidence.status).all()
+    
+    result = {
+        "current": 0,
+        "expiring_soon": 0,
+        "expired": 0,
+        "archived": 0,
+        "total": 0
+    }
+    
+    for status, count in stats:
+        result[status.value] = count
+        result["total"] += count
+    
+    return result
+
+
 @app.get("/api/compliance")
 async def compliance():
     """Future endpoint for compliance rule management"""
@@ -415,3 +744,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
