@@ -738,7 +738,34 @@ async def compliance():
         "message": "Compliance Rules endpoint - Coming soon",
         "description": "Define and manage compliance rules for AI systems",
         "status": "under_development"
+    
     }
+
+
+@app.delete("/api/systems/{system_id}", status_code=204)
+async def delete_ai_system(system_id: str, db: Session = Depends(get_db)):
+    """Delete an AI system and all its associated data"""
+    system = db.query(AISystem).filter(AISystem.id == system_id).first()
+    
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    # Delete all evidence for this system
+    db.query(Evidence).filter(Evidence.ai_system_id == system_id).delete()
+    
+    # Delete all requirement mappings for this system
+    db.query(RequirementMapping).filter(RequirementMapping.ai_system_id == system_id).delete()
+    
+    # Delete the system itself
+    db.delete(system)
+    db.commit()
+    
+    print(f"✅ AI system '{system.name}' and all associated data deleted")
+    
+    return None
+
+
+
 
 if __name__ == "__main__":
     import uvicorn
