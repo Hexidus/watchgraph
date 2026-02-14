@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form
+from auth import get_current_user, verify_token
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Security
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import os
@@ -86,7 +87,10 @@ app = FastAPI(
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=[
+        "http://localhost:3000",
+        "https://watchgraph-ui.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -132,12 +136,52 @@ async def version():
     }
 
 # ============================================
+# DASHBOARD ENDPOINT
+# ============================================
+
+@app.get("/api/dashboard/stats")
+async def get_dashboard_stats(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get overall dashboard statistics across all AI systems
+    
+    Requires authentication.
+    """
+    # Total systems
+    total_systems = db.query(AISystem).count()
+    
+    # Total requirements across all systems
+    total_requirements = db.query(RequirementMapping).count()
+    
+    # Completed requirements
+    completed_requirements = db.query(RequirementMapping).filter(
+        RequirementMapping.status == ComplianceStatus.COMPLETED
+    ).count()
+    
+    # Calculate overall compliance
+    if total_requirements == 0:
+        overall_compliance = 0
+    else:
+        overall_compliance = round((completed_requirements / total_requirements) * 100, 2)
+    
+    return {
+        "total_systems": total_systems,
+        "total_requirements": total_requirements,
+        "completed_requirements": completed_requirements,
+        "overall_compliance": overall_compliance,
+        "user_email": current_user["email"]
+    }
+
+# ============================================
 # AI SYSTEMS ENDPOINTS
 # ============================================
 
 @app.post("/api/systems", response_model=AISystemResponse, status_code=201)
 async def create_ai_system(
     system: AISystemCreate,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -193,7 +237,10 @@ async def create_ai_system(
     )
 
 @app.get("/api/systems", response_model=List[AISystemResponse])
-async def list_ai_systems(db: Session = Depends(get_db)):
+async def list_ai_systems(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """List all registered AI systems"""
     systems = db.query(AISystem).all()
     
@@ -213,7 +260,11 @@ async def list_ai_systems(db: Session = Depends(get_db)):
     ]
 
 @app.get("/api/systems/{system_id}", response_model=AISystemResponse)
-async def get_ai_system(system_id: str, db: Session = Depends(get_db)):
+async def get_ai_system(
+    system_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Get details of a specific AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     
@@ -237,7 +288,10 @@ async def get_ai_system(system_id: str, db: Session = Depends(get_db)):
 # ============================================
 
 @app.get("/api/requirements")
-async def list_requirements(db: Session = Depends(get_db)):
+async def list_requirements(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """List all EU AI Act compliance requirements"""
     requirements = db.query(ComplianceRequirement).all()
     
@@ -254,7 +308,11 @@ async def list_requirements(db: Session = Depends(get_db)):
     ]
 
 @app.get("/api/systems/{system_id}/requirements")
-async def get_system_requirements(system_id: str, db: Session = Depends(get_db)):
+async def get_system_requirements(
+    system_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Get all compliance requirements for a specific AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
@@ -286,7 +344,11 @@ async def get_system_requirements(system_id: str, db: Session = Depends(get_db))
     return results
 
 @app.get("/api/systems/{system_id}/compliance")
-async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
+async def get_system_compliance(
+    system_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Get compliance status overview for an AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
@@ -336,6 +398,7 @@ async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
 async def update_requirement_status(
     mapping_id: str,
     update: RequirementStatusUpdate,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Update the compliance status of a requirement"""
@@ -377,7 +440,7 @@ async def update_requirement_status(
     }
 
 # ============================================
-# EVIDENCE ENDPOINTS
+# EVIDENCE ENDPOINTS (keeping these without auth for now)
 # ============================================
 
 @app.post("/api/requirements/{mapping_id}/evidence", status_code=201)
@@ -738,12 +801,15 @@ async def compliance():
         "message": "Compliance Rules endpoint - Coming soon",
         "description": "Define and manage compliance rules for AI systems",
         "status": "under_development"
-    
     }
 
 
 @app.delete("/api/systems/{system_id}", status_code=204)
-async def delete_ai_system(system_id: str, db: Session = Depends(get_db)):
+async def delete_ai_system(
+    system_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Delete an AI system and all its associated data"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     
@@ -763,8 +829,6 @@ async def delete_ai_system(system_id: str, db: Session = Depends(get_db)):
     print(f"✅ AI system '{system.name}' and all associated data deleted")
     
     return None
-
-
 
 
 if __name__ == "__main__":
